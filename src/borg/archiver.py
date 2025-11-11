@@ -7,6 +7,7 @@ try:
     import argparse
     import collections
     import configparser
+    import csv
     import faulthandler
     import functools
     import inspect
@@ -1446,6 +1447,55 @@ class Archiver:
             json_print(basic_json_data(manifest, extra={
                 'archives': output_data
             }))
+
+        return self.exit_code
+
+    @with_repository(compatibility=(Manifest.Operation.READ,))
+    def do_chunks_dump(self, args, repository, manifest, key):
+        """Dump information about all chunks to CSV"""
+
+        def process_archives(cache):
+            # Create CSV writer to stdout
+            writer = csv.writer(sys.stdout)
+            # Write header
+            writer.writerow(['chunk_id', 'archive_name', 'compressed_size',
+                           'uncompressed_size', 'file_path', 'offset'])
+
+            # Get list of archives to process
+            archive_list = manifest.archives.list(
+                glob=args.glob_archives if hasattr(args, 'glob_archives') else None,
+                consider_checkpoints=args.consider_checkpoints if hasattr(args, 'consider_checkpoints') else False,
+                sort_by=['ts']
+            )
+
+            for archive_info in archive_list:
+                archive_name = archive_info.name
+                archive = Archive(repository, key, manifest, archive_name, cache=cache)
+
+                for item in archive.iter_items():
+                    # Only process items that have chunks (regular files)
+                    if item.chunks:
+                        file_path = item.path
+
+                        for chunk_index, chunk_entry in enumerate(item.chunks):
+                            # Convert chunk ID to hex string
+                            chunk_id_hex = hexlify(chunk_entry.id).decode('ascii')
+                            compressed_size = chunk_entry.csize
+                            uncompressed_size = chunk_entry.size
+                            # Calculate offset: sum of all previous chunk sizes
+                            offset = sum(c.size for c in item.chunks[:chunk_index])
+
+                            writer.writerow([
+                                chunk_id_hex,
+                                archive_name,
+                                compressed_size,
+                                uncompressed_size,
+                                file_path,
+                                offset
+                            ])
+
+        # Process without cache for simplicity
+        process_archives(cache=None)
 
         return self.exit_code
 
@@ -4644,6 +4694,44 @@ class Archiver:
                                help='paths to list; patterns are supported')
         define_archive_filters_group(subparser)
         define_exclusion_group(subparser)
+
+        # borg chunks-dump
+        chunks_dump_epilog = process_epilog("""
+        This command dumps information about all chunks in all archives to CSV format.
+
+        The output contains one row per chunk occurrence with the following columns:
+        - chunk_id: hexadecimal chunk identifier
+        - archive_name: name of the archive containing this chunk
+        - compressed_size: size of the chunk when compressed
+        - uncompressed_size: original size of the chunk
+        - file_path: path of the file containing this chunk
+        - offset: byte offset of this chunk within the file
+
+        Note: Due to deduplication, the same chunk may appear multiple times in the output
+        if it is referenced by multiple files or archives.
+
+        Examples::
+
+            # Dump all chunks from all archives
+            $ borg chunks-dump /path/to/repo
+
+            # Dump chunks and save to compressed file
+            $ borg chunks-dump /path/to/repo | xz > chunks.csv.xz
+
+            # Dump only chunks from specific archives
+            $ borg chunks-dump /path/to/repo --glob-archives 'backup-*'
+        """)
+        subparser = subparsers.add_parser('chunks-dump', parents=[common_parser], add_help=False,
+                                          description=self.do_chunks_dump.__doc__,
+                                          epilog=chunks_dump_epilog,
+                                          formatter_class=argparse.RawDescriptionHelpFormatter,
+                                          help='dump chunk information to CSV')
+        subparser.set_defaults(func=self.do_chunks_dump)
+        subparser.add_argument('location', metavar='REPOSITORY', type=location_validator(),
+                               help='repository to dump chunks from')
+        subparser.add_argument('--consider-checkpoints', action='store_true', dest='consider_checkpoints',
+                               help='include checkpoint archives (default: exclude)')
+        define_archive_filters_group(subparser)
 
         subparser = subparsers.add_parser('mount', parents=[common_parser], add_help=False,
                                         description=self.do_mount.__doc__,
